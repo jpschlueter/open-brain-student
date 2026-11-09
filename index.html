@@ -237,11 +237,12 @@
     <section id="tab-youtube" class="hidden">
       <div class="card">
         <h2>📹 YouTube</h2>
-        <p class="help">Paste a video link. Your browser is not allowed to fetch YouTube's transcript for you (you will automate this in Level 3), so for now you copy it from YouTube and paste it below.</p>
+        <p class="help">Paste a video link and click <b>Capture automatically</b>. Your server fetches the transcript and saves it. If it can't (no transcript, or the free monthly quota is used up), it tells you and shows a box to paste the transcript yourself.</p>
         <label for="ytUrl">YouTube link</label>
         <input type="url" id="ytUrl" placeholder="https://www.youtube.com/watch?v=...">
         <div class="row">
-          <button onclick="loadYouTube()">Look up video</button>
+          <button id="ytAutoBtn" onclick="autoYouTube()">Capture automatically</button>
+          <button class="ghost" onclick="loadYouTube()">Paste transcript myself</button>
           <span class="msg" id="ytLookupMsg"></span>
         </div>
 
@@ -293,10 +294,14 @@
     <section id="tab-url" class="hidden">
       <div class="card">
         <h2>🔗 Web article</h2>
-        <p class="help">Browsers forbid one website from reading another website, for good security reasons. So for now: open the article, select the text, copy it, and paste it below. In Level 3 you will automate this.</p>
+        <p class="help">Paste a link and click <b>Fetch automatically</b>. Your server reads the page and saves its text. Some pages block readers or need a login; for those, paste the text yourself below.</p>
         <label for="webUrl">Article link</label>
         <input type="url" id="webUrl" placeholder="https://...">
-        <label for="webText">Article text</label>
+        <div class="row">
+          <button id="webAutoBtn" onclick="autoUrl()">Fetch automatically</button>
+          <span class="msg" id="webAutoMsg"></span>
+        </div>
+        <label for="webText">Or paste the article text yourself</label>
         <textarea id="webText" placeholder="Paste the article text here..." style="min-height:180px"></textarea>
         <div class="row">
           <button id="webSaveBtn" onclick="saveUrl()">Save to Brain</button>
@@ -834,6 +839,75 @@
       await saveSource(thought.id, text, 'web')
       $('webUrl').value = ''
       $('webText').value = ''
+    })
+  }
+
+  // ---------------------------------------------------------------
+  // Automatic capture (Level 3): the app hands the link to an Edge
+  // Function on your server, which fetches and saves it. supabase-js sends
+  // your login token along, so the function knows whose brain it is.
+  // ---------------------------------------------------------------
+  async function callFunction(name, body) {
+    const { data, error } = await db.functions.invoke(name, { body })
+    if (error) throw new Error(error.message || 'Could not reach your capture function.')
+    return data || {}
+  }
+
+  async function runAuto(btnId, fn) {
+    const btn = $(btnId)
+    const label = btn.textContent
+    btn.disabled = true
+    btn.textContent = 'Capturing...'
+    try { await fn() } finally {
+      btn.disabled = false
+      btn.textContent = label
+    }
+  }
+
+  async function autoYouTube() {
+    const link = $('ytUrl').value.trim()
+    if (!getYouTubeId(link)) { setMsg('ytLookupMsg', '✗ That does not look like a YouTube link.', 'err'); return }
+    $('ytStep2').classList.add('hidden')
+    setMsg('ytLookupMsg', 'Fetching the transcript on your server... this can take up to 30 seconds.', 'info')
+    await runAuto('ytAutoBtn', async () => {
+      try {
+        const r = await callFunction('capture-youtube', { url: link })
+        if (r.ok) {
+          $('ytUrl').value = ''
+          setMsg('ytLookupMsg', '✓ Saved "' + r.title + '" (' + Number(r.chars).toLocaleString() + ' characters of transcript)', 'ok')
+        } else if (r.needs_manual) {
+          await loadYouTube() // shows the paste box for this video
+          setMsg('ytLookupMsg', '⚠ ' + r.error + ' Paste the transcript yourself below.', 'err')
+        } else {
+          setMsg('ytLookupMsg', '✗ ' + (r.error || 'Capture failed.'), 'err')
+        }
+      } catch (e) {
+        setMsg('ytLookupMsg', '✗ ' + e.message, 'err')
+      }
+    })
+  }
+
+  async function autoUrl() {
+    const link = $('webUrl').value.trim()
+    try {
+      const u = new URL(link)
+      if (!/^https?:$/.test(u.protocol)) throw new Error()
+    } catch (e) {
+      setMsg('webAutoMsg', '✗ Enter a full link starting with https://', 'err'); return
+    }
+    setMsg('webAutoMsg', 'Fetching the page on your server...', 'info')
+    await runAuto('webAutoBtn', async () => {
+      try {
+        const r = await callFunction('capture-url', { url: link })
+        if (r.ok) {
+          $('webUrl').value = ''
+          setMsg('webAutoMsg', '✓ Saved "' + r.title + '" (' + Number(r.chars).toLocaleString() + ' characters)', 'ok')
+        } else {
+          setMsg('webAutoMsg', '✗ ' + (r.error || 'Capture failed.'), 'err')
+        }
+      } catch (e) {
+        setMsg('webAutoMsg', '✗ ' + e.message, 'err')
+      }
     })
   }
 
