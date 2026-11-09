@@ -1,0 +1,15 @@
+name: Keep the brain awake
+on:
+  schedule:
+    - cron: '0 10 * * 1,5'
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ping the project's own API
+        run: |
+          URL=$(grep "SUPABASE_URL" config.js | sed -E "s/.*'([^']*)'.*/\1/")
+          KEY=$(grep "SUPABASE_ANON_KEY" config.js | sed -E "s/.*'([^']*)'.*/\1/")
+          curl -sf "$URL/rest/v1/thoughts?select=id&limit=1" -H "apikey: $KEY" -H "Authorization: Bearer $KEY" -o /dev/null
