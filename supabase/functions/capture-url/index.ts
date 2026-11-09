@@ -119,7 +119,9 @@ Deno.serve(async (req) => {
     const { data: { user }, error: authError } = await admin.auth.getUser(token)
     if (authError || !user) return json({ ok: false, error: 'Not signed in. Sign in to your app and try again.' })
 
-    const { url } = await req.json().catch(() => ({}))
+    const { url, collection: rawCollection } = await req.json().catch(() => ({}))
+    // Optional folder/collection name from bulk import, e.g. "EMS Research"
+    const collection = typeof rawCollection === 'string' ? rawCollection.trim().slice(0, 80) : ''
     if (!url || typeof url !== 'string') return json({ ok: false, error: 'A link is required.' })
 
     let parsed: URL
@@ -176,8 +178,12 @@ Deno.serve(async (req) => {
       .from('thoughts')
       .insert({
         user_id: user.id,
-        content: `🔗 URL: ${finalUrl}\n${title}\n\n${text}`,
-        metadata: { source: 'url', title, url: finalUrl, hostname: new URL(finalUrl).hostname },
+        content: `🔗 URL: ${finalUrl}\n${title}${collection ? `\n📁 ${collection}` : ''}\n\n${text}`,
+        metadata: {
+          source: 'url', title, url: finalUrl, requested_url: parsed.toString(),
+          hostname: new URL(finalUrl).hostname,
+          ...(collection ? { collection } : {}),
+        },
       })
       .select('id')
       .single()

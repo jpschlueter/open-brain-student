@@ -194,6 +194,7 @@
       <button class="tab" data-tab="pdf">📄 PDF</button>
       <button class="tab" data-tab="url">🔗 URL</button>
       <button class="tab" data-tab="search">🔍 Search</button>
+      <button class="tab" data-tab="import">📥 Import</button>
     </nav>
 
     <!-- RECENT -->
@@ -308,6 +309,24 @@
           <span class="msg" id="webMsg"></span>
         </div>
       </div>
+    </section>
+
+    <!-- IMPORT -->
+    <section id="tab-import" class="hidden">
+      <div class="card">
+        <h2>📥 Bulk import</h2>
+        <p class="help">Paste many links at once, one per line. YouTube links get their transcript; everything else is fetched as an article. A line starting with <b>#</b> names the collection for the links below it (for example <code># EMS Research</code>). Other lines are ignored. Links already in your brain are skipped.</p>
+        <textarea id="importText" placeholder="# EMS Research&#10;https://example.com/article-one&#10;https://www.youtube.com/watch?v=...&#10;&#10;# Learning Science&#10;https://example.com/article-two" style="min-height:220px; font-family: ui-monospace, Menlo, monospace; font-size:0.82rem"></textarea>
+        <div class="row">
+          <button id="importBtn" onclick="startImport()">Import all</button>
+          <button class="ghost hidden" id="importStopBtn" onclick="stopImport()">Stop</button>
+          <button class="ghost hidden" id="importRetryBtn" onclick="retryFailed()">Retry failed</button>
+          <span class="msg" id="importMsg"></span>
+        </div>
+        <div class="progress hidden" id="importProgressWrap"><div id="importProgress"></div></div>
+      </div>
+      <div class="section-label" id="importLogLabel"></div>
+      <div id="importLog"></div>
     </section>
 
     <!-- SEARCH -->
@@ -523,7 +542,7 @@
   // ---------------------------------------------------------------
   // Tabs
   // ---------------------------------------------------------------
-  const TABS = ['recent', 'voice', 'youtube', 'pdf', 'url', 'search']
+  const TABS = ['recent', 'voice', 'youtube', 'pdf', 'url', 'search', 'import']
   $('tabs').addEventListener('click', e => {
     const btn = e.target.closest('.tab')
     if (!btn) return
@@ -909,6 +928,140 @@
         setMsg('webAutoMsg', '✗ ' + e.message, 'err')
       }
     })
+  }
+
+  // ---------------------------------------------------------------
+  // Bulk import: one link per line, "# Name" sets the collection.
+  // Works through the list one link at a time with the same capture
+  // functions as the YouTube and URL tabs, running as you (logged in).
+  // ---------------------------------------------------------------
+  let importItems = [] // { url, collection, status, detail }
+  let importStopping = false
+
+  function isYouTubeUrl(url) {
+    try { return /(^|\.)(youtube\.com|youtu\.be)$/i.test(new URL(url).hostname) } catch (e) { return false }
+  }
+
+  function parseImport(text) {
+    const items = []
+    const seen = new Set()
+    let collection = ''
+    for (const raw of text.split('\n')) {
+      const line = raw.trim()
+      if (!line) continue
+      if (line.startsWith('#')) { collection = line.replace(/^#+/, '').trim().slice(0, 80); continue }
+      const m = line.match(/https?:\/\/\S+/)
+      if (!m) continue
+      const url = m[0].replace(/[),.;'"]+$/, '')
+      try { new URL(url) } catch (e) { continue }
+      if (seen.has(url)) continue
+      seen.add(url)
+      items.push({ url, collection, status: 'waiting', detail: '' })
+    }
+    return items
+  }
+
+  // Skip links that are already in your brain (from any tab or an earlier import)
+  async function alreadySaved(url) {
+    if (isYouTubeUrl(url)) {
+      const id = getYouTubeId(url)
+      if (!id) return false
+      const { data } = await db.from('thoughts').select('id').eq('metadata->>video_id', id).limit(1)
+      return Boolean(data && data.length)
+    }
+    for (const field of ['url', 'requested_url']) {
+      const { data } = await db.from('thoughts').select('id').eq('metadata->>' + field, url).limit(1)
+      if (data && data.length) return true
+    }
+    return false
+  }
+
+  function renderImport() {
+    const icons = { waiting: '⏳', working: '🔄', saved: '✅', skipped: '↩️', failed: '❌' }
+    const count = s => importItems.filter(i => i.status === s).length
+    const done = importItems.length - count('waiting') - count('working')
+    $('importLogLabel').textContent =
+      `${count('saved')} saved · ${count('skipped')} already in brain · ${count('failed')} failed · ${count('waiting')} waiting`
+    $('importProgress').style.width = (importItems.length ? Math.round(done / importItems.length * 100) : 0) + '%'
+    $('importLog').innerHTML = importItems.map(it => `
+      <div class="thought">
+        <div class="thought-text">${icons[it.status]} ${esc(it.detail || it.url)}</div>
+        <div class="thought-time">${it.collection ? '📁 ' + esc(it.collection) + ' · ' : ''}${esc(it.url)}</div>
+      </div>`).join('')
+  }
+
+  async function startImport() {
+    const items = parseImport($('importText').value)
+    if (!items.length) { setMsg('importMsg', 'No links found. Put one link per line.', 'err'); return }
+    importItems = items
+    await runImport()
+  }
+
+  async function retryFailed() {
+    importItems.forEach(it => { if (it.status === 'failed') { it.status = 'waiting'; it.detail = '' } })
+    await runImport()
+  }
+
+  function stopImport() {
+    importStopping = true
+    setMsg('importMsg', 'Stopping after the current link...', 'info')
+  }
+
+  async function runImport() {
+    importStopping = false
+    let youtubePaused = false
+    $('importBtn').disabled = true
+    $('importStopBtn').classList.remove('hidden')
+    $('importRetryBtn').classList.add('hidden')
+    $('importProgressWrap').classList.remove('hidden')
+    setMsg('importMsg', 'Importing... keep this tab open until it finishes.', 'info')
+    renderImport()
+
+    for (const it of importItems) {
+      if (importStopping) break
+      if (it.status !== 'waiting') continue
+      it.status = 'working'
+      renderImport()
+      try {
+        if (await alreadySaved(it.url)) {
+          it.status = 'skipped'
+          it.detail = 'Already in your brain'
+          continue
+        }
+        const yt = isYouTubeUrl(it.url)
+        if (yt && youtubePaused) {
+          it.status = 'failed'
+          it.detail = 'Not tried: the YouTube transcript quota is used up. Retry next month.'
+          continue
+        }
+        const r = await callFunction(yt ? 'capture-youtube' : 'capture-url', { url: it.url, collection: it.collection })
+        if (r.ok) {
+          it.status = 'saved'
+          it.detail = (yt ? '📹 ' : '🔗 ') + r.title
+        } else {
+          it.status = 'failed'
+          it.detail = r.error || 'Capture failed.'
+          if (yt && /quota/i.test(it.detail)) youtubePaused = true
+        }
+      } catch (e) {
+        it.status = 'failed'
+        it.detail = e.message
+      } finally {
+        renderImport()
+      }
+    }
+
+    const failed = importItems.filter(i => i.status === 'failed').length
+    const waiting = importItems.filter(i => i.status === 'waiting').length
+    $('importBtn').disabled = false
+    $('importStopBtn').classList.add('hidden')
+    $('importRetryBtn').classList.toggle('hidden', failed === 0)
+    setMsg('importMsg',
+      waiting ? `Stopped. ${waiting} link(s) not tried yet. Click Import all to carry on; links already saved are skipped.`
+        : failed ? `Done, with ${failed} failed. Retry them, or open those pages and paste the text in the URL tab.`
+        : '✓ Done. Everything is in your brain.',
+      failed || waiting ? 'err' : 'ok')
+    loadRecent()
   }
 
   // ---------------------------------------------------------------

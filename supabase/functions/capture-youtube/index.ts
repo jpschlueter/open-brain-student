@@ -138,7 +138,9 @@ Deno.serve(async (req) => {
     const { data: { user }, error: authError } = await admin.auth.getUser(token)
     if (authError || !user) return json({ ok: false, error: 'Not signed in. Sign in to your app and try again.' })
 
-    const { url } = await req.json().catch(() => ({}))
+    const { url, collection: rawCollection } = await req.json().catch(() => ({}))
+    // Optional folder/collection name from bulk import, e.g. "EMS Research"
+    const collection = typeof rawCollection === 'string' ? rawCollection.trim().slice(0, 80) : ''
     if (!url || typeof url !== 'string') return json({ ok: false, error: 'A YouTube link is required.' })
 
     const videoId = extractVideoId(url)
@@ -162,7 +164,7 @@ Deno.serve(async (req) => {
       .from('thoughts')
       .insert({
         user_id: user.id,
-        content: `📹 YouTube: ${title}\n${videoUrl}\n\n${text}`,
+        content: `📹 YouTube: ${title}\n${videoUrl}${collection ? `\n📁 ${collection}` : ''}\n\n${text}`,
         metadata: {
           source: 'youtube',
           title,
@@ -171,6 +173,7 @@ Deno.serve(async (req) => {
           has_transcript: true,
           fetched_via: 'supadata',
           lang: result.lang ?? null,
+          ...(collection ? { collection } : {}),
         },
       })
       .select('id')
