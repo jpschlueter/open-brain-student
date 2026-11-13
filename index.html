@@ -559,7 +559,7 @@
   async function insertThought(content, metadata) {
     const row = { content, user_id: user.id }
     if (metadata) row.metadata = metadata
-    const { data, error } = await db.from('thoughts').insert(row).select('id').single()
+    const { data, error } = await db.from('thoughts').upsert(row, { onConflict: 'dedup_key,user_id', ignoreDuplicates: false }).select('id').single()
     if (error) throw error
     return data
   }

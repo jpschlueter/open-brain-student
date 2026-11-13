@@ -114,7 +114,7 @@ async function runDigest(): Promise<Record<string, unknown>> {
   const content = `${heading}\n\n${result.text}`
 
   // 5. Save it as a thought. enriched_at is set so the enrichment agent skips it.
-  const { error: insertError } = await db.from('thoughts').insert({
+  const { error: insertError } = await db.from('thoughts').upsert({
     user_id: OWNER_USER_ID,
     content,
     category: 'digest',
@@ -122,7 +122,7 @@ async function runDigest(): Promise<Record<string, unknown>> {
     summary: `Weekly digest of ${rows.length} thoughts, ${shortDate(weekAgo)} to ${shortDate(now)}.`,
     enriched_at: now.toISOString(),
     metadata: { source: 'weekly-digest', period_start: weekAgo.toISOString(), period_end: now.toISOString(), thought_count: rows.length },
-  })
+  }, { onConflict: 'dedup_key,user_id', ignoreDuplicates: false })
   if (insertError) throw insertError
 
   // 6. Deliver it on Telegram (optional, never fails the run)

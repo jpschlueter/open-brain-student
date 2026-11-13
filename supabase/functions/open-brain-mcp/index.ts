@@ -192,7 +192,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
       if (content.length > 20_000) return toolText('That is too long to save in one thought (max 20,000 characters).', true)
       const { data, error } = await db
         .from('thoughts')
-        .insert({ content, user_id: OWNER_USER_ID, metadata: { source: 'mcp' } })
+        .upsert({ content, user_id: OWNER_USER_ID, metadata: { source: 'mcp' } }, { onConflict: 'dedup_key,user_id', ignoreDuplicates: false })
         .select('id, created_at').single()
       if (error) throw error
       return toolText(`Saved to the Open Brain (id: ${data.id}, ${data.created_at.slice(0, 10)}).`)

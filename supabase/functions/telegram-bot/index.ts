@@ -177,11 +177,11 @@ Deno.serve(async (req: Request) => {
     }
 
     // 7. Everything else is a thought: save it, owned by you
-    const { error } = await db.from('thoughts').insert({
+    const { error } = await db.from('thoughts').upsert({
       content: text,
       user_id: OWNER_USER_ID,
       metadata: { source: 'telegram' },
-    })
+    }, { onConflict: 'dedup_key,user_id', ignoreDuplicates: false })
     if (error) throw error
     await reply(chatId!, '🧠 Saved to your brain.')
     return ok()

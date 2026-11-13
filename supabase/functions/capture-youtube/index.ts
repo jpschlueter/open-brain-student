@@ -162,7 +162,7 @@ Deno.serve(async (req) => {
     // skips the Level 2 security rule, so user_id is set by hand from the login above.
     const { data: thought, error: insertError } = await admin
       .from('thoughts')
-      .insert({
+      .upsert({
         user_id: user.id,
         content: `📹 YouTube: ${title}\n${videoUrl}${collection ? `\n📁 ${collection}` : ''}\n\n${text}`,
         metadata: {
@@ -175,7 +175,7 @@ Deno.serve(async (req) => {
           lang: result.lang ?? null,
           ...(collection ? { collection } : {}),
         },
-      })
+      }, { onConflict: 'dedup_key,user_id', ignoreDuplicates: false })
       .select('id')
       .single()
     if (insertError) throw insertError
