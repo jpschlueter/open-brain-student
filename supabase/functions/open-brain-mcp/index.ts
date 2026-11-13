@@ -28,6 +28,7 @@
 // ============================================================================
 
 import { createClient } from 'npm:@supabase/supabase-js@2'
+import { embed } from '../_shared/llm.ts'
 
 const ACCESS_KEY = Deno.env.get('MCP_ACCESS_KEY') ?? ''
 const OWNER_USER_ID = Deno.env.get('OWNER_USER_ID') ?? ''
@@ -60,13 +61,15 @@ const TOOLS = [
     name: 'search_thoughts',
     description:
       "Search the user's personal knowledge base (their 'Open Brain': notes, voice notes, " +
-      'YouTube transcripts, articles, PDFs, Telegram messages) for thoughts containing ALL of the ' +
-      'given words. Use short keywords (1-3 words), and try synonyms if nothing is found. ' +
-      'Returns up to 10 matches, newest first; long items are shortened, use get_thought for full text.',
+      'YouTube transcripts, articles, PDFs, Telegram messages) BY MEANING: it finds related ideas ' +
+      'even when they use different words. Phrase the query naturally (a few words or a question). ' +
+      'Returns up to 10 matches, most similar first, each with a similarity score and the thoughts ' +
+      'it is linked to in the user\'s thought graph. Long items are shortened; use get_thought for full text. ' +
+      'Falls back to keyword matching if meaning search is unavailable.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Keywords to look for, e.g. "airway" or "tourniquet"' },
+        query: { type: 'string', description: 'What to look for, e.g. "avoiding over-ventilation" or "how do I teach death notification?"' },
       },
       required: ['query'],
     },
@@ -147,6 +150,40 @@ function formatRows(rows: Row[], heading: string): string {
   }).join('\n\n')
 }
 
+// The thought graph: for each result, the thoughts it is linked to (either direction)
+async function relatedFor(ids: string[]): Promise<Map<string, { id: string; score: number; preview: string }[]>> {
+  const out = new Map<string, { id: string; score: number; preview: string }[]>()
+  if (!ids.length) return out
+  try {
+    const list = ids.join(',')
+    const { data: links } = await db.from('thought_links')
+      .select('source_thought_id, target_thought_id, similarity_score')
+      .eq('user_id', OWNER_USER_ID)
+      .or(`source_thought_id.in.(${list}),target_thought_id.in.(${list})`)
+      .order('similarity_score', { ascending: false })
+      .limit(100)
+    if (!links?.length) return out
+    const otherIds = new Set<string>()
+    for (const l of links) { otherIds.add(l.source_thought_id); otherIds.add(l.target_thought_id) }
+    const { data: others } = await db.from('thoughts')
+      .select('id, content, summary')
+      .eq('user_id', OWNER_USER_ID)
+      .in('id', [...otherIds])
+    const previews = new Map((others ?? []).map((t) => [t.id, (t.summary?.trim() || t.content.replace(/\s+/g, ' ').slice(0, 200))]))
+    for (const l of links) {
+      for (const [from, to] of [[l.source_thought_id, l.target_thought_id], [l.target_thought_id, l.source_thought_id]]) {
+        if (!ids.includes(from)) continue
+        const arr = out.get(from) ?? []
+        if (arr.length < 3) arr.push({ id: to, score: l.similarity_score, preview: previews.get(to) ?? '' })
+        out.set(from, arr)
+      }
+    }
+  } catch (e) {
+    console.warn('[open-brain-mcp] could not load linked thoughts:', e)
+  }
+  return out
+}
+
 // ---------------------------------------------------------------------------
 // The tools themselves
 // ---------------------------------------------------------------------------
@@ -155,13 +192,40 @@ async function callTool(name: string, args: Record<string, unknown>) {
     case 'search_thoughts': {
       const query = String(args.query ?? '').trim()
       if (!query) return toolText('Please provide a search query.', true)
-      // Every word must appear (in any order). % and _ are searched literally.
+
+      // 1. Meaning search: turn the query into an embedding, find the closest thoughts
+      const vector = await embed(query, { userId: OWNER_USER_ID, source: 'mcp-search' })
+      if (vector) {
+        const { data: hits, error: rpcErr } = await db.rpc('search_thoughts', {
+          query_embedding: JSON.stringify(vector),
+          p_user_id: OWNER_USER_ID,
+          match_threshold: 0.3,
+          match_count: 10,
+        })
+        if (rpcErr) console.error('[open-brain-mcp] semantic search failed:', rpcErr.message)
+        const rows = (hits ?? []) as (Row & { similarity: number })[]
+        if (rows.length) {
+          const related = await relatedFor(rows.map((r) => r.id))
+          const text = rows.map((r, i) => {
+            const body = r.content.length > PREVIEW_CHARS
+              ? r.content.slice(0, PREVIEW_CHARS) + `\n[…shortened: ${r.content.length.toLocaleString()} characters in total. Call get_thought with this id for the full text.]`
+              : r.content
+            const links = (related.get(r.id) ?? []).map((l) =>
+              `   ↳ linked (similarity ${l.score.toFixed(2)}), id: ${l.id}: ${l.preview}`).join('\n')
+            return `--- ${i + 1}. id: ${r.id} | saved: ${r.created_at.slice(0, 10)} | similarity: ${r.similarity.toFixed(2)} ---\n${body}` +
+              (links ? `\n\nConnected thoughts:\n${links}` : '')
+          }).join('\n\n')
+          return toolText(`Meaning-based results for "${query}" (${rows.length}):\n\n${text}`)
+        }
+      }
+
+      // 2. Fallback: keyword search. Every word must appear (in any order). % and _ are searched literally.
       const words = query.split(/\s+/).filter(Boolean).slice(0, 6)
       let q = db.from('thoughts').select('id, content, created_at').eq('user_id', OWNER_USER_ID)
       for (const w of words) q = q.ilike('content', `%${w.replace(/[\\%_]/g, (m) => '\\' + m)}%`)
       const { data, error } = await q.order('created_at', { ascending: false }).limit(10)
       if (error) throw error
-      return toolText(formatRows(data ?? [], `Search results for "${query}" (${data?.length ?? 0}):`))
+      return toolText(formatRows(data ?? [], `Keyword results for "${query}" (${data?.length ?? 0}):`))
     }
 
     case 'list_recent': {

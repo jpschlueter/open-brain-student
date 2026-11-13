@@ -141,6 +141,98 @@ function logUsage(req: LLMRequest, r: LLMResult): void {
   }
 }
 
+// ============================================================================
+// EMBEDDINGS — turn text into a list of numbers that captures its meaning
+// ============================================================================
+// To switch embedding providers, change EMBEDDING_PROVIDER / EMBEDDING_MODEL in
+// Supabase secrets. The vector dimension must stay 1536 or you need a new
+// migration (the database column is vector(1536)).
+//
+// Secrets it reads:
+//   EMBEDDING_PROVIDER   "openrouter" (default)
+//   EMBEDDING_MODEL      default "openai/text-embedding-3-small" (1536 numbers)
+//   OPENROUTER_API_KEY   your key from openrouter.ai
+//
+// Never throws: returns null on any failure, so a save can always continue
+// without an embedding and get one later.
+// ============================================================================
+const EMBEDDING_PROVIDER = (Deno.env.get('EMBEDDING_PROVIDER') ?? 'openrouter').trim().toLowerCase()
+const EMBEDDING_MODEL = (Deno.env.get('EMBEDDING_MODEL') ?? 'openai/text-embedding-3-small').trim()
+export const EMBEDDING_DIMENSIONS = 1536
+const MAX_EMBED_CHARS = 24_000 // the model reads about 8,000 tokens at most
+
+const EMBED_PRICES: Record<string, number> = { // dollars per 1M tokens
+  'openai/text-embedding-3-small': 0.02,
+}
+
+export async function embed(text: string, opts: { userId?: string; source?: string } = {}): Promise<number[] | null> {
+  const input = (text ?? '').trim().slice(0, MAX_EMBED_CHARS)
+  if (!input) return null
+  try {
+    let vector: number[] | null = null
+    let tokens = 0
+    switch (EMBEDDING_PROVIDER) {
+      case 'openrouter': {
+        const key = Deno.env.get('OPENROUTER_API_KEY')
+        if (!key) { console.warn('[embed] OPENROUTER_API_KEY secret is not set'); return null }
+        const res = await fetch('https://openrouter.ai/api/v1/embeddings', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: EMBEDDING_MODEL, input }),
+          signal: AbortSignal.timeout(15_000),
+        })
+        if (!res.ok) {
+          console.warn(`[embed] provider returned HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
+          return null
+        }
+        const data = await res.json()
+        vector = data?.data?.[0]?.embedding ?? null
+        tokens = data?.usage?.prompt_tokens ?? data?.usage?.total_tokens ?? 0
+        break
+      }
+      // To add another provider: add a case here and set its key in secrets.
+      default:
+        console.warn(`[embed] unknown EMBEDDING_PROVIDER "${EMBEDDING_PROVIDER}"`)
+        return null
+    }
+    if (!Array.isArray(vector) || vector.length !== EMBEDDING_DIMENSIONS) {
+      console.warn(`[embed] expected ${EMBEDDING_DIMENSIONS} numbers, got ${Array.isArray(vector) ? vector.length : 'none'}`)
+      return null
+    }
+    logUsageRow(opts.userId, 'embedding', EMBEDDING_MODEL, opts.source, tokens, 0,
+      ((EMBED_PRICES[EMBEDDING_MODEL] ?? 0) * tokens) / 1_000_000)
+    return vector
+  } catch (e) {
+    console.warn('[embed] failed:', e)
+    return null
+  }
+}
+
+// Shared receipt writer for embeddings (same never-fail rule as logUsage)
+function logUsageRow(
+  userId: string | undefined, kind: string, model: string, source: string | undefined,
+  inTok: number, outTok: number, cost: number,
+): void {
+  try {
+    if (!userId) return
+    const admin = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
+      { auth: { persistSession: false, autoRefreshToken: false } },
+    )
+    const pending = Promise.resolve(admin.from('llm_usage').insert({
+      user_id: userId, kind, model, source: source ?? null,
+      prompt_tokens: inTok, completion_tokens: outTok, cost_usd: cost,
+    })).then(({ error }) => {
+      if (error) console.warn('[llm] usage log failed (ignored):', error.message)
+    }, (e: unknown) => console.warn('[llm] usage log failed (ignored):', e))
+    // deno-lint-ignore no-explicit-any
+    ;(globalThis as any).EdgeRuntime?.waitUntil?.(pending)
+  } catch (e) {
+    console.warn('[llm] usage log failed (ignored):', e)
+  }
+}
+
 // Pull a JSON object out of model text, tolerating ```json fences
 export function parseJSON<T>(text: string): T | null {
   const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim()

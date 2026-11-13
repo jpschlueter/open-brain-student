@@ -16,11 +16,15 @@
 // ============================================================================
 
 import { createClient } from 'npm:@supabase/supabase-js@2'
-import { callLLM, parseJSON } from '../_shared/llm.ts'
+import { callLLM, embed, parseJSON } from '../_shared/llm.ts'
 
 const BATCH = 8               // thoughts per run, keeps each run short
 const MIN_CHARS = 20          // shorter than this: nothing worth tagging
 const MAX_INPUT_CHARS = 12_000 // long transcripts: the first ~3,000 words is plenty for tags
+const EMBED_BATCH = 20        // embeddings are fast and cost almost nothing
+const LINK_BATCH = 20
+const LINK_THRESHOLD = 0.5    // how similar two thoughts must be to get linked
+const LINK_COUNT = 5          // at most this many links per thought
 
 const CATEGORIES = ['idea', 'learning', 'question', 'reference', 'plan', 'reflection'] as const
 
@@ -119,6 +123,57 @@ Deno.serve((req) => {
   return work // (only when running somewhere without background work support)
 })
 
+// ---------------------------------------------------------------------------
+// Level 6: give thoughts an embedding (their "address" by meaning), then link
+// each one to its nearest neighbors. Both phases also work through older
+// thoughts a batch at a time, so no separate backfill tool is needed.
+// ---------------------------------------------------------------------------
+async function embedPending(): Promise<{ embedded: number; embed_failed: number }> {
+  const { data: rows, error } = await db
+    .from('thoughts')
+    .select('id, user_id, content')
+    .is('embedding', null)
+    .not('user_id', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(EMBED_BATCH)
+  if (error) throw error
+  let embedded = 0, embed_failed = 0
+  for (const row of (rows ?? []) as Row[]) {
+    const vector = await embed(row.content, { userId: row.user_id, source: 'enrich-thought' })
+    if (!vector) { embed_failed++; continue } // stays empty; a later run retries
+    const { error: upErr } = await db.from('thoughts')
+      .update({ embedding: JSON.stringify(vector), linked_at: null })
+      .eq('id', row.id)
+    if (upErr) { console.error(`[embed] save failed for ${row.id}:`, upErr.message); embed_failed++ } else embedded++
+  }
+  return { embedded, embed_failed }
+}
+
+async function linkPending(): Promise<{ linked_thoughts: number; new_links: number }> {
+  const { data: rows, error } = await db
+    .from('thoughts')
+    .select('id, user_id')
+    .not('embedding', 'is', null)
+    .is('linked_at', null)
+    .not('user_id', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(LINK_BATCH)
+  if (error) throw error
+  let linked_thoughts = 0, new_links = 0
+  for (const row of rows ?? []) {
+    const { data: n, error: rpcErr } = await db.rpc('auto_link_thought', {
+      p_source_id: row.id,
+      p_user_id: row.user_id, // links stay within one person's brain
+      match_threshold: LINK_THRESHOLD,
+      match_count: LINK_COUNT,
+    })
+    if (rpcErr) { console.error(`[link] ${row.id} failed:`, rpcErr.message); continue }
+    linked_thoughts++
+    new_links += Number(n ?? 0)
+  }
+  return { linked_thoughts, new_links }
+}
+
 async function runBatch(): Promise<Response> {
   try {
     // Ignore whatever was sent; just look for thoughts that still need enriching
@@ -134,8 +189,15 @@ async function runBatch(): Promise<Response> {
     const counts = { enriched: 0, skipped: 0, failed: 0 }
     for (const row of rows ?? []) counts[await enrichOne(row as Row)]++
 
-    console.log('[enrich] run finished:', counts)
-    return new Response(JSON.stringify({ ok: true, ...counts }), {
+    // Level 6 phases. Each is independent: one failing never stops the others.
+    let embedCounts = { embedded: 0, embed_failed: 0 }
+    let linkCounts = { linked_thoughts: 0, new_links: 0 }
+    try { embedCounts = await embedPending() } catch (e) { console.error('[embed] phase failed:', e) }
+    try { linkCounts = await linkPending() } catch (e) { console.error('[link] phase failed:', e) }
+
+    const all = { ...counts, ...embedCounts, ...linkCounts }
+    console.log('[enrich] run finished:', all)
+    return new Response(JSON.stringify({ ok: true, ...all }), {
       status: 200, headers: { 'Content-Type': 'application/json' },
     })
   } catch (err) {
