@@ -17,6 +17,7 @@
 
 import { createClient } from 'npm:@supabase/supabase-js@2'
 import { callLLM, embed, parseJSON } from '../_shared/llm.ts'
+import { saveThoughtChunksSafe } from '../_shared/thought-chunks.ts'
 
 const BATCH = 8               // thoughts per run, keeps each run short
 const MIN_CHARS = 20          // shorter than this: nothing worth tagging
@@ -25,6 +26,7 @@ const EMBED_BATCH = 20        // embeddings are fast and cost almost nothing
 const LINK_BATCH = 20
 const LINK_THRESHOLD = 0.5    // how similar two thoughts must be to get linked
 const LINK_COUNT = 5          // at most this many links per thought
+const CHUNK_BATCH = 3         // long thoughts chunked per run (each can be dozens of pieces)
 
 const CATEGORIES = ['idea', 'learning', 'question', 'reference', 'plan', 'reflection'] as const
 
@@ -174,6 +176,27 @@ async function linkPending(): Promise<{ linked_thoughts: number; new_links: numb
   return { linked_thoughts, new_links }
 }
 
+// ---------------------------------------------------------------------------
+// Level 7: cut long captures into overlapping pieces, each with its own
+// embedding. Uses the thoughts_needing_chunks list, so it also works through
+// everything saved before today, a few thoughts per run (biggest first).
+// ---------------------------------------------------------------------------
+async function chunkPending(): Promise<{ chunked_thoughts: number; chunks_written: number }> {
+  const { data: pending, error } = await db
+    .from('thoughts_needing_chunks')
+    .select('id, user_id')
+    .limit(CHUNK_BATCH)
+  if (error) throw error
+  let chunked_thoughts = 0, chunks_written = 0
+  for (const p of pending ?? []) {
+    const { data: t } = await db.from('thoughts').select('content').eq('id', p.id).maybeSingle()
+    if (!t?.content) continue
+    const n = await saveThoughtChunksSafe(db, p.id, t.content, 'enrich-thought', 'summary', p.user_id)
+    if (n > 0) { chunked_thoughts++; chunks_written += n }
+  }
+  return { chunked_thoughts, chunks_written }
+}
+
 async function runBatch(): Promise<Response> {
   try {
     // Ignore whatever was sent; just look for thoughts that still need enriching
@@ -194,8 +217,10 @@ async function runBatch(): Promise<Response> {
     let linkCounts = { linked_thoughts: 0, new_links: 0 }
     try { embedCounts = await embedPending() } catch (e) { console.error('[embed] phase failed:', e) }
     try { linkCounts = await linkPending() } catch (e) { console.error('[link] phase failed:', e) }
+    let chunkCounts = { chunked_thoughts: 0, chunks_written: 0 }
+    try { chunkCounts = await chunkPending() } catch (e) { console.error('[chunk] phase failed:', e) }
 
-    const all = { ...counts, ...embedCounts, ...linkCounts }
+    const all = { ...counts, ...embedCounts, ...linkCounts, ...chunkCounts }
     console.log('[enrich] run finished:', all)
     return new Response(JSON.stringify({ ok: true, ...all }), {
       status: 200, headers: { 'Content-Type': 'application/json' },

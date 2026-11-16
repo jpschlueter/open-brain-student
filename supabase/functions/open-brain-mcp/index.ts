@@ -193,33 +193,41 @@ async function callTool(name: string, args: Record<string, unknown>) {
       const query = String(args.query ?? '').trim()
       if (!query) return toolText('Please provide a search query.', true)
 
-      // 1. Meaning search: turn the query into an embedding, find the closest thoughts
+      // 1. Hybrid search (Level 7): meaning + exact keywords, fused, chunk-aware.
+      //    If the embedding can't be made, the database still does the keyword half.
       const vector = await embed(query, { userId: OWNER_USER_ID, source: 'mcp-search' })
-      if (vector) {
-        const { data: hits, error: rpcErr } = await db.rpc('search_thoughts', {
-          query_embedding: JSON.stringify(vector),
-          p_user_id: OWNER_USER_ID,
-          match_threshold: 0.3,
-          match_count: 10,
-        })
-        if (rpcErr) console.error('[open-brain-mcp] semantic search failed:', rpcErr.message)
-        const rows = (hits ?? []) as (Row & { similarity: number })[]
-        if (rows.length) {
-          const related = await relatedFor(rows.map((r) => r.id))
-          const text = rows.map((r, i) => {
-            const body = r.content.length > PREVIEW_CHARS
+      const { data: hits, error: rpcErr } = await db.rpc('search_thoughts', {
+        query_text: query,
+        p_user_id: OWNER_USER_ID, // required: this server skips security rules, so it filters by owner itself
+        query_embedding: vector ? JSON.stringify(vector) : null,
+        match_threshold: 0.3,
+        match_count: 10,
+        max_per_document: 2,
+      })
+      if (rpcErr) console.error('[open-brain-mcp] hybrid search failed:', rpcErr.message)
+      const rows = (hits ?? []) as (Row & { similarity: number; matched_chunk: string | null; match_source: string })[]
+      if (!rpcErr && rows.length) {
+        const related = await relatedFor(rows.map((r) => r.id))
+        const text = rows.map((r, i) => {
+          // When the match came from inside a long capture, show THAT passage as the reason
+          const firstLine = r.content.split('\n').find((l) => l.trim())?.slice(0, 200) ?? ''
+          const body = r.matched_chunk
+            ? `${firstLine}\nMatching passage (from partway through a longer capture):\n"${r.matched_chunk.trim()}"\n` +
+              `[Full capture is ${r.content.length.toLocaleString()} characters. Call get_thought with this id to read all of it.]`
+            : r.content.length > PREVIEW_CHARS
               ? r.content.slice(0, PREVIEW_CHARS) + `\n[…shortened: ${r.content.length.toLocaleString()} characters in total. Call get_thought with this id for the full text.]`
               : r.content
-            const links = (related.get(r.id) ?? []).map((l) =>
-              `   ↳ linked (similarity ${l.score.toFixed(2)}), id: ${l.id}: ${l.preview}`).join('\n')
-            return `--- ${i + 1}. id: ${r.id} | saved: ${r.created_at.slice(0, 10)} | similarity: ${r.similarity.toFixed(2)} ---\n${body}` +
-              (links ? `\n\nConnected thoughts:\n${links}` : '')
-          }).join('\n\n')
-          return toolText(`Meaning-based results for "${query}" (${rows.length}):\n\n${text}`)
-        }
+          const links = (related.get(r.id) ?? []).map((l) =>
+            `   ↳ linked (similarity ${l.score.toFixed(2)}), id: ${l.id}: ${l.preview}`).join('\n')
+          const how = r.similarity > 0 ? `meaning similarity ${r.similarity.toFixed(2)}` : 'exact keyword match'
+          return `--- ${i + 1}. id: ${r.id} | saved: ${r.created_at.slice(0, 10)} | ${how} ---\n${body}` +
+            (links ? `\n\nConnected thoughts:\n${links}` : '')
+        }).join('\n\n')
+        return toolText(`Results for "${query}" (meaning + keywords, ${rows.length}):\n\n${text}`)
       }
+      if (!rpcErr) return toolText(`No thoughts found for "${query}". Try other words.`)
 
-      // 2. Fallback: keyword search. Every word must appear (in any order). % and _ are searched literally.
+      // 2. Only if the database search itself failed: plain keyword match. % and _ are searched literally.
       const words = query.split(/\s+/).filter(Boolean).slice(0, 6)
       let q = db.from('thoughts').select('id, content, created_at').eq('user_id', OWNER_USER_ID)
       for (const w of words) q = q.ilike('content', `%${w.replace(/[\\%_]/g, (m) => '\\' + m)}%`)

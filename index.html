@@ -333,7 +333,7 @@
     <section id="tab-search" class="hidden">
       <div class="card">
         <h2>🔍 Search your brain</h2>
-        <p class="help">Finds every thought that contains your words (keyword search). In Level 6 you will add search by meaning.</p>
+        <p class="help">Searches by meaning and by exact words together, including passages inside long captures.</p>
         <form id="searchForm" class="row" style="margin-top:0">
           <input type="search" id="searchInput" placeholder="Search..." style="flex:1; min-width:160px">
           <button type="submit">Search</button>
@@ -1076,20 +1076,43 @@
     label.textContent = 'Searching...'
     out.innerHTML = ''
     try {
-      // Escape % and _ so they are searched for literally
-      const safe = q.replace(/[\\%_]/g, m => '\\' + m)
-      const { data, error } = await db
-        .from('thoughts').select('id, content, created_at')
-        .ilike('content', '%' + safe + '%')
-        .order('created_at', { ascending: false }).limit(50)
-      if (error) throw error
-      label.textContent = data.length + ' result' + (data.length === 1 ? '' : 's') + ' for "' + q + '"'
-      out.innerHTML = data.length ? renderThoughts(data) : '<div class="empty">Nothing found. Try a different word.</div>'
+      // Level 7: the same hybrid search Claude uses (meaning + exact keywords,
+      // chunk-aware), run by the search-brain server function.
+      const r = await callFunction('search-brain', { query: q, limit: 20 })
+      if (!r.ok) throw new Error(r.error || 'Search failed')
+      const data = r.results || []
+      label.textContent = data.length + ' result' + (data.length === 1 ? '' : 's') + ' for "' + q + '"' +
+        (r.meaning_used ? '' : ' (keywords only right now)')
+      out.innerHTML = data.length ? renderSearchResults(data) : '<div class="empty">Nothing found. Try different words.</div>'
     } catch (err) {
       label.textContent = ''
       out.innerHTML = '<div class="empty" style="color:#ef4444">Search failed: ' + esc(err.message) + '</div>'
     }
   })
+
+  // Search results: when the match came from inside a long capture, show that passage
+  function renderSearchResults(rows) {
+    return rows.map(t => {
+      const text = t.content || ''
+      const title = (text.split('\n').find(l => l.trim()) || '').slice(0, 200)
+      const how = t.similarity > 0 ? 'meaning match ' + Number(t.similarity).toFixed(2) : 'exact keyword match'
+      let body
+      if (t.matched_chunk) {
+        body = `<div class="thought-text"><b>${esc(title)}</b></div>
+          <div class="thought-text" style="margin-top:8px;border-left:3px solid #6366f1;padding-left:10px;color:#ddd">${esc(t.matched_chunk.trim())}</div>
+          <div class="thought-time">(from partway through a longer capture)</div>
+          <details><summary>Show full text (${text.length.toLocaleString()} characters)</summary>
+          <div class="thought-text">${esc(text)}</div></details>`
+      } else if (text.length > 600) {
+        body = `<div class="thought-text">${esc(text.slice(0, 600))}…</div>
+          <details><summary>Show full text (${text.length.toLocaleString()} characters)</summary>
+          <div class="thought-text">${esc(text)}</div></details>`
+      } else {
+        body = `<div class="thought-text">${esc(text)}</div>`
+      }
+      return `<div class="thought">${body}<div class="thought-time">${fmt(t.created_at)} · ${how}</div></div>`
+    }).join('')
+  }
 
   function clearSearch() {
     $('searchInput').value = ''
